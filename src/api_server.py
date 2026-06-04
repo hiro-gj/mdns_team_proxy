@@ -36,6 +36,7 @@ class mDNSProxyAPIHandler(BaseHTTPRequestHandler):
             token = auth_header.split(' ')[1]
             try:
                 data = json.loads(post_data)
+                import dns_resolver
                 
                 # DB更新
                 with self.server.db.get_connection() as conn:
@@ -52,7 +53,13 @@ class mDNSProxyAPIHandler(BaseHTTPRequestHandler):
                         )
                         proxy_id = cursor.lastrowid
                     
+                    # 既存の other_records は、該当するプロキシから送られてきた最新のレコードで完全に上書き（置き換え）
+                    cursor.execute('DELETE FROM other_records WHERE source_proxy_id = ?', (proxy_id,))
+                    
                     for record in data.get('records', []):
+                        # ループバックアドレスの除外
+                        if dns_resolver.is_loopback(record['ip_address']):
+                            continue
                         cursor.execute(
                             '''
                             INSERT INTO other_records (source_proxy_id, hostname, ip_address, record_type, ttl)

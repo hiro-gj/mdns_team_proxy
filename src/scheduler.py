@@ -4,30 +4,54 @@ import dns_resolver
 
 from logger_config import logger
 
+def _get_node_id(sys_config):
+    import os
+    import uuid
+    from config import get_base_dir
+    # system.ini から node_id を取得
+    if sys_config.has_section('system') and sys_config.has_option('system', 'node_id'):
+        return sys_config.get('system', 'node_id')
+    
+    # なければ自動生成
+    node_id = str(uuid.uuid4())[:8]
+    if not sys_config.has_section('system'):
+        sys_config.add_section('system')
+    sys_config.set('system', 'node_id', node_id)
+    
+    # system.ini に書き戻す
+    try:
+        path = os.path.join(get_base_dir(), 'system.ini')
+        with open(path, 'w', encoding='utf-8') as f:
+            sys_config.write(f)
+    except Exception as e:
+        logger.error(f"[_get_node_id] Failed to save node_id to system.ini: {e}")
+    return node_id
+
 def loop_task(db, sys_config):
     while True:
         try:
             logger.info("[Scheduler] Running periodic tasks...")
-            
-            # 1. 独自DNS名前解決（static_hosts -> self_records）
+            interval = int(sys_config.get('system', 'interval', fallback='30'))
+
+            # 1. TTL減算とクリーンアップ（期限切れを先に排除し、同期やマージへの混入を防ぐ）
+            _cleanup_records(db, interval)
+
+            # 2. 独自DNS名前解決（static_hosts -> self_records）
             dns_resolver.resolve_all(db, sys_config)
 
-            # 2. プロキシ発見（固定IPから）
+            # 3. プロキシ発見（固定IPから）
             _discover_proxies(db, sys_config)
 
-            # 3. 自レコード(self_records)を他のプロキシに送信
+            # 4. 自レコード(self_records)を他のプロキシに送信
             _sync_to_others(db, sys_config)
 
-            # 4. マージ処理（self_records + other_records -> merged_records）
+            # 5. マージ処理（self_records + other_records -> merged_records）
             _merge_records(db)
-
-            # 5. TTL減算とクリーンアップ
-            _cleanup_records(db)
 
         except Exception as e:
             logger.error(f"[Scheduler] Error: {e}")
+            interval = int(sys_config.get('system', 'interval', fallback='30'))
         
-        interval = int(sys_config.get('system', 'interval', fallback='30'))
         time.sleep(interval)
 
 def start(db, sys_config):
@@ -98,7 +122,9 @@ def _sync_to_others(db, sys_config):
         
     token_prefix = sys_config.get('system', 'token_prefix', fallback='mDNSProxy_')
     import socket
-    token = f"{token_prefix}{socket.gethostname()}"
+    node_id = _get_node_id(sys_config)
+    # ホスト名が衝突しても一意性を保つため、UUIDベースの短縮ID(node_id)を組み合わせる
+    token = f"{token_prefix}{socket.gethostname()}_{node_id}"
     
     # other-records 送信
     if records:
@@ -138,32 +164,70 @@ def _merge_records(db):
         # 一旦全クリア
         cursor.execute('DELETE FROM merged_records')
         
-        # self_records をコピー
-        # 重複を排除するためGROUP BYを使用
+        # self_records（自ノード解決）と other_records（他ノード同期）から、
+        # ホスト名（hostname）ごとに最良の1件のIPアドレスのみを決定してマージする（最新・最良優先マージアルゴリズム）。
+        # 優先順位：1. 手動固定IP（resolution_method = 'static'）を最優先。
+        #           2. それ以外（自動名前解決）は、登録・更新日時（registered_at）がより新しいものを優先。
         cursor.execute('''
-            INSERT INTO merged_records (hostname, ip_address, record_type, ttl, source_type, source_record_id)
-            SELECT hostname, ip_address, record_type, MAX(ttl), 'self', MIN(record_id)
-            FROM self_records
-            GROUP BY hostname, ip_address, record_type
-        ''')
-        
-        # other_records をコピー
-        # 既に self_records として登録されているものと、other_records内の重複を排除
-        cursor.execute('''
-            INSERT INTO merged_records (hostname, ip_address, record_type, ttl, source_type, source_record_id)
-            SELECT hostname, ip_address, record_type, MAX(ttl), 'other', MIN(record_id)
-            FROM other_records
-            WHERE NOT EXISTS (
-                SELECT 1 FROM merged_records m 
-                WHERE m.hostname = other_records.hostname 
-                  AND m.ip_address = other_records.ip_address 
-                  AND m.record_type = other_records.record_type
+            WITH candidates AS (
+                SELECT 
+                    hostname, 
+                    ip_address, 
+                    record_type, 
+                    ttl, 
+                    'self' as source_type, 
+                    record_id as source_record_id,
+                    updated_at as registered_at,
+                    CASE WHEN resolution_method = 'static' THEN 1 ELSE 2 END as priority
+                FROM self_records
+                WHERE ip_address NOT LIKE '127.%' AND ip_address != '::1'
+
+                UNION ALL
+
+                SELECT 
+                    hostname, 
+                    ip_address, 
+                    record_type, 
+                    ttl, 
+                    'other' as source_type, 
+                    record_id as source_record_id,
+                    received_at as registered_at,
+                    2 as priority
+                FROM other_records
+                WHERE ip_address NOT LIKE '127.%' AND ip_address != '::1'
+            ),
+            ranked AS (
+                SELECT *,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY hostname 
+                           ORDER BY priority ASC, registered_at DESC, source_record_id DESC
+                       ) as rn
+                FROM candidates
             )
-            GROUP BY hostname, ip_address, record_type
+            INSERT INTO merged_records (hostname, ip_address, record_type, ttl, source_type, source_record_id)
+            SELECT hostname, ip_address, record_type, ttl, source_type, source_record_id
+            FROM ranked
+            WHERE rn = 1
         ''')
         
         conn.commit()
 
-def _cleanup_records(db):
-    # TODO: ttl 減算や古いレコード削除
-    pass
+def _cleanup_records(db, interval):
+    with db.get_connection() as conn:
+        cursor = conn.cursor()
+        
+        # self_records の TTL 減算と削除
+        cursor.execute('UPDATE self_records SET ttl = ttl - ?', (interval,))
+        cursor.execute('DELETE FROM self_records WHERE ttl <= 0')
+        deleted_self = cursor.rowcount
+        
+        # other_records の TTL 減算と削除
+        cursor.execute('UPDATE other_records SET ttl = ttl - ?', (interval,))
+        cursor.execute('DELETE FROM other_records WHERE ttl <= 0')
+        deleted_other = cursor.rowcount
+        
+        conn.commit()
+        
+        total_deleted = deleted_self + deleted_other
+        if total_deleted > 0:
+            logger.info(f"[Scheduler] Removed {total_deleted} expired records during cleanup")
