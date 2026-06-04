@@ -4,27 +4,49 @@ import dns_resolver
 
 from logger_config import logger
 
+def _get_node_id(sys_config):
+    import os
+    import uuid
+    from config import get_base_dir
+    # system.ini から node_id を取得
+    if sys_config.has_section('system') and sys_config.has_option('system', 'node_id'):
+        return sys_config.get('system', 'node_id')
+    
+    # なければ自動生成
+    node_id = str(uuid.uuid4())[:8]
+    if not sys_config.has_section('system'):
+        sys_config.add_section('system')
+    sys_config.set('system', 'node_id', node_id)
+    
+    # system.ini に書き戻す
+    try:
+        path = os.path.join(get_base_dir(), 'system.ini')
+        with open(path, 'w', encoding='utf-8') as f:
+            sys_config.write(f)
+    except Exception as e:
+        logger.error(f"[_get_node_id] Failed to save node_id to system.ini: {e}")
+    return node_id
+
 def loop_task(db, sys_config):
     while True:
         try:
             logger.info("[Scheduler] Running periodic tasks...")
-            
-            # 1. 独自DNS名前解決（static_hosts -> self_records）
-            dns_resolver.resolve_all(db, sys_config)
-
-            # 2. プロキシ発見（固定IPから）
-            _discover_proxies(db, sys_config)
-
-            # 3. 自レコード(self_records)を他のプロキシに送信
-            _sync_to_others(db, sys_config)
-
             interval = int(sys_config.get('system', 'interval', fallback='30'))
 
-            # 4. マージ処理（self_records + other_records -> merged_records）
-            _merge_records(db)
-
-            # 5. TTL減算とクリーンアップ
+            # 1. TTL減算とクリーンアップ（期限切れを先に排除し、同期やマージへの混入を防ぐ）
             _cleanup_records(db, interval)
+
+            # 2. 独自DNS名前解決（static_hosts -> self_records）
+            dns_resolver.resolve_all(db, sys_config)
+
+            # 3. プロキシ発見（固定IPから）
+            _discover_proxies(db, sys_config)
+
+            # 4. 自レコード(self_records)を他のプロキシに送信
+            _sync_to_others(db, sys_config)
+
+            # 5. マージ処理（self_records + other_records -> merged_records）
+            _merge_records(db)
 
         except Exception as e:
             logger.error(f"[Scheduler] Error: {e}")
@@ -100,7 +122,9 @@ def _sync_to_others(db, sys_config):
         
     token_prefix = sys_config.get('system', 'token_prefix', fallback='mDNSProxy_')
     import socket
-    token = f"{token_prefix}{socket.gethostname()}"
+    node_id = _get_node_id(sys_config)
+    # ホスト名が衝突しても一意性を保つため、UUIDベースの短縮ID(node_id)を組み合わせる
+    token = f"{token_prefix}{socket.gethostname()}_{node_id}"
     
     # other-records 送信
     if records:
@@ -156,7 +180,7 @@ def _merge_records(db):
                     updated_at as registered_at,
                     CASE WHEN resolution_method = 'static' THEN 1 ELSE 2 END as priority
                 FROM self_records
-                WHERE ip_address != '127.0.0.1'
+                WHERE ip_address NOT LIKE '127.%' AND ip_address != '::1'
 
                 UNION ALL
 
@@ -170,7 +194,7 @@ def _merge_records(db):
                     received_at as registered_at,
                     2 as priority
                 FROM other_records
-                WHERE ip_address != '127.0.0.1'
+                WHERE ip_address NOT LIKE '127.%' AND ip_address != '::1'
             ),
             ranked AS (
                 SELECT *,

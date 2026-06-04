@@ -36,6 +36,7 @@ class mDNSProxyAPIHandler(BaseHTTPRequestHandler):
             token = auth_header.split(' ')[1]
             try:
                 data = json.loads(post_data)
+                import dns_resolver
                 
                 # DB更新
                 with self.server.db.get_connection() as conn:
@@ -56,8 +57,8 @@ class mDNSProxyAPIHandler(BaseHTTPRequestHandler):
                     cursor.execute('DELETE FROM other_records WHERE source_proxy_id = ?', (proxy_id,))
                     
                     for record in data.get('records', []):
-                        # 127.0.0.1 の除外
-                        if record['ip_address'] == '127.0.0.1':
+                        # ループバックアドレスの除外
+                        if dns_resolver.is_loopback(record['ip_address']):
                             continue
                         cursor.execute(
                             '''

@@ -61,11 +61,17 @@ def _get_my_ips():
 
 def _handle_query(db, sock, data, addr):
     from logger_config import logger
+    import ipaddress
     
     # 自己解決（自己参照）ループ防止ガード
-    # 自分自身（プロキシノード本体）からの名前解決クエリに対しては応答を返さないようにする
+    # 自分自身（プロキシノード本体やループバックアドレス全体）からの名前解決クエリに対しては応答を返さないようにする
+    try:
+        is_loop = ipaddress.ip_address(addr[0]).is_loopback
+    except ValueError:
+        is_loop = False
+
     my_ips = _get_my_ips()
-    if addr[0] in my_ips:
+    if is_loop or addr[0] in my_ips:
         return
 
     queried_hostname = _extract_hostname(data)

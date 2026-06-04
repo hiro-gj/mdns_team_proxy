@@ -1,6 +1,13 @@
 import socket
 import os
 import subprocess
+import ipaddress
+
+def is_loopback(ip_str: str) -> bool:
+    try:
+        return ipaddress.ip_address(ip_str).is_loopback
+    except ValueError:
+        return False
 
 def resolve_all(db, sys_config):
     """static_hosts に登録されているホストを全て名前解決し、self_records に登録する"""
@@ -17,8 +24,8 @@ def resolve_all(db, sys_config):
                 ip, method = _resolve_host(hostname)
                 
             if ip:
-                # 127.0.0.1 の除外
-                if ip == '127.0.0.1':
+                # ループバックアドレスの除外
+                if is_loopback(ip):
                     continue
                 ttl = int(sys_config.get('system', 'ttl', fallback='120'))
                 # 既存レコードがあれば更新、なければ追加
@@ -26,9 +33,9 @@ def resolve_all(db, sys_config):
                 if cursor.fetchone():
                     cursor.execute('''
                         UPDATE self_records 
-                        SET ip_address = ?, resolution_method = ?, updated_at = CURRENT_TIMESTAMP
+                        SET ip_address = ?, ttl = ?, resolution_method = ?, updated_at = CURRENT_TIMESTAMP
                         WHERE hostname = ?
-                    ''', (ip, method, hostname))
+                    ''', (ip, ttl, method, hostname))
                 else:
                     cursor.execute('''
                         INSERT INTO self_records (hostname, ip_address, record_type, ttl, resolution_method)
