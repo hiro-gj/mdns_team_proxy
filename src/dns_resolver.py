@@ -17,6 +17,9 @@ def resolve_all(db, sys_config):
                 ip, method = _resolve_host(hostname)
                 
             if ip:
+                # 127.0.0.1 の除外
+                if ip == '127.0.0.1':
+                    continue
                 ttl = int(sys_config.get('system', 'ttl', fallback='120'))
                 # 既存レコードがあれば更新、なければ追加
                 cursor.execute('SELECT record_id FROM self_records WHERE hostname = ?', (hostname,))
@@ -37,27 +40,11 @@ def resolve_all(db, sys_config):
 def _resolve_host(hostname):
     """
     複数手法で名前解決を試みる。
+    OSキャッシュや自分自身のmDNS Proxyが返した古いレコードを誤って再解決（自己参照ループ）するのを防ぐため、
+    システムのDNSリゾルバー（socket.gethostbyname）は使用せず、生mDNSクエリおよびpingのみで実在を確認する。
     """
     ip = None
     method = None
-
-    # .local を付けて試す
-    try:
-        if not hostname.endswith('.local'):
-            ip = socket.gethostbyname(f"{hostname}.local")
-        else:
-            ip = socket.gethostbyname(hostname)
-        method = 'socket'
-        return ip, method
-    except Exception:
-        pass
-
-    try:
-        ip = socket.gethostbyname(hostname)
-        method = 'socket'
-        return ip, method
-    except Exception:
-        pass
 
     # Pure Python による簡易mDNSクエリフォールバック (socketのみ使用)
     try:

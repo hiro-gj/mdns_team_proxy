@@ -43,8 +43,31 @@ def _listen(db):
         except Exception as e:
             logger.error(f"[mDNS Server] Error: {e}")
 
+def _get_my_ips():
+    ips = ['127.0.0.1', 'localhost']
+    try:
+        # ホスト名から解決
+        ips.append(socket.gethostbyname(socket.gethostname()))
+    except Exception:
+        pass
+    try:
+        # ルーティングされるメインIPを取得
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(('8.8.8.8', 80))
+            ips.append(s.getsockname()[0])
+    except Exception:
+        pass
+    return list(set(ips))
+
 def _handle_query(db, sock, data, addr):
     from logger_config import logger
+    
+    # 自己解決（自己参照）ループ防止ガード
+    # 自分自身（プロキシノード本体）からの名前解決クエリに対しては応答を返さないようにする
+    my_ips = _get_my_ips()
+    if addr[0] in my_ips:
+        return
+
     queried_hostname = _extract_hostname(data)
     if not queried_hostname:
         return

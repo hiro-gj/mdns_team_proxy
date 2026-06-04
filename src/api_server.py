@@ -52,7 +52,13 @@ class mDNSProxyAPIHandler(BaseHTTPRequestHandler):
                         )
                         proxy_id = cursor.lastrowid
                     
+                    # 既存の other_records は、該当するプロキシから送られてきた最新のレコードで完全に上書き（置き換え）
+                    cursor.execute('DELETE FROM other_records WHERE source_proxy_id = ?', (proxy_id,))
+                    
                     for record in data.get('records', []):
+                        # 127.0.0.1 の除外
+                        if record['ip_address'] == '127.0.0.1':
+                            continue
                         cursor.execute(
                             '''
                             INSERT INTO other_records (source_proxy_id, hostname, ip_address, record_type, ttl)
