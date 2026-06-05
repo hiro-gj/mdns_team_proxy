@@ -25,13 +25,17 @@ interval = 10
 # 発信トークン接頭語
 token_prefix = mDNSProxy_
 # HTTP待ち受けポート
-port = 80
+port = 53080
 # TTL初期値（秒）
 ttl = 120
+# ノード識別ID（複数サーバで重複しない値となる）
+# 初回起動時に自動生成されるため手動記入不要
+node_id =
 
 [network]
 # 外部mDNSプロキシIPアドレスとポート（カンマ区切りで複数指定可能）
-external_proxies = 192.168.1.10:80,192.168.2.10:8080
+# 中継・収束方式に対応しており、フルメッシュで到達できない環境でも中継可能なプロキシを定義することで、全ノード間で自動同期されます
+external_proxies = 192.168.1.10:53080,192.168.2.10:53080
 
 # Wi-Fi設定（Raspberry Pi Pico用）
 wifi_ssid = your_wifi_ssid
