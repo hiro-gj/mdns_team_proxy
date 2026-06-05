@@ -35,10 +35,10 @@ echo "[2/3] systemd デーモンのリロード..."
 sudo systemctl daemon-reload
 sudo systemctl reset-failed
 
-# インストールディレクトリの削除
-echo "[3/3] インストールディレクトリの削除..."
+# インストールディレクトリの削除 (データベース、設定ファイル、ログもすべて削除されます)
+echo "[3/3] インストールディレクトリ（データベース、設定、ログを含む）の削除..."
 if [ -d "$INSTALL_DIR" ]; then
-    echo "ディレクトリを削除しています: $INSTALL_DIR"
+    echo "ディレクトリおよび格納されているDB/設定/ログファイルを完全に削除しています: $INSTALL_DIR"
     sudo rm -rf "$INSTALL_DIR"
 fi
 
