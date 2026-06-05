@@ -55,7 +55,7 @@ def _instant_execution_mode(db, sys_config):
 
 def _show_merged_records(db):
     print("\n--- マージ済みレコード ---")
-    with db.get_connection() as conn:
+    with db.connection() as conn:
         cursor = conn.cursor()
         cursor.execute('SELECT hostname, ip_address, source_type FROM merged_records')
         rows = cursor.fetchall()
@@ -66,7 +66,7 @@ def _show_merged_records(db):
 
 def _show_static_hosts(db):
     print("\n--- 静的ホスト ---")
-    with db.get_connection() as conn:
+    with db.connection() as conn:
         cursor = conn.cursor()
         cursor.execute('SELECT host_id, hostname FROM static_hosts')
         rows = cursor.fetchall()
@@ -79,7 +79,7 @@ def _add_static_host(db):
     hostname = input("ホスト名 (FQDN) を入力してください: ")
     if not hostname:
         return
-    with db.get_connection() as conn:
+    with db.connection() as conn:
         cursor = conn.cursor()
         try:
             cursor.execute('INSERT INTO static_hosts (hostname) VALUES (?)', (hostname,))
@@ -93,7 +93,7 @@ def _remove_static_host(db):
     host_id = input("削除するIDを入力してください: ")
     if not host_id.isdigit():
         return
-    with db.get_connection() as conn:
+    with db.connection() as conn:
         cursor = conn.cursor()
         cursor.execute('DELETE FROM static_hosts WHERE host_id = ?', (host_id,))
         if cursor.rowcount > 0:

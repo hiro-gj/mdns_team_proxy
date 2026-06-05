@@ -46,7 +46,7 @@ After=network.target
 Type=simple
 User=root
 WorkingDirectory=/opt/mdns_proxy
-ExecStart=/usr/bin/python3 /opt/mdns_proxy/src/main.py
+ExecStart=/usr/bin/python3 /opt/mdns_proxy/src/main.py --daemon
 Restart=on-failure
 
 [Install]
@@ -58,7 +58,7 @@ sudo systemctl daemon-reload
 
 echo "=== インストール完了 ==="
 echo "インストール先: $INSTALL_DIR"
-echo "手動起動(対話メニュー): sudo python3 $INSTALL_DIR/src/main.py"
+echo "手動起動(対話メニュー): sudo python3 $INSTALL_DIR/src/main.py --cli"
 echo "サービスファイル: $SERVICE_FILE"
 echo ""
 echo "※ サービスの起動は手動で行ってください。"
