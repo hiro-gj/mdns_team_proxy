@@ -1,0 +1,38 @@
+name: Release Package Creator
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-upload:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v4
+
+      - name: Remove excluded folders and files
+        run: |
+          # フォルダの除外
+          rm -rf specs
+          rm -rf .github
+
+          # ファイルの除外
+          rm -f .gitattributes
+          rm -f .gitignore
+          rm -f README.md
+
+      - name: Create Release Archive
+        run: |
+          # .gitフォルダもアーカイブに含めないように削除
+          rm -rf .git
+          zip -r mdns_proxy.zip .
+
+      - name: Upload Release Asset
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload ${{ github.event.release.tag_name }} mdns_proxy.zip --clobber
