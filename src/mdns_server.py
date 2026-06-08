@@ -63,26 +63,36 @@ def _handle_query(db, sock, data, addr):
     from logger_config import logger
     import ipaddress
     
+    queried_hostname = _extract_hostname(data)
+    if not queried_hostname:
+        return
+
+    # サービスタイプクエリ（アンダースコアで始まるサービス名）は名前解決プロキシの対象外として早期リターン
+    if queried_hostname.startswith('_'):
+        return
+
     # 自己解決（自己参照）ループ防止ガード
-    # 自分自身（プロキシノード本体やループバックアドレス全体）からの名前解決クエリに対しては応答を返さないようにする
+    # 自分自身（プロキシノード本体やループバックアドレス全体）からの名前解決クエリに対して、
+    # 自身のホスト名に関するクエリの場合は応答を返さないようにする（無限ループ防止）
+    # ただし、他ノードから同期されたマージ済みレコード(merged_records)の名前解決クエリに対しては、
+    # 自ホスト自身による名前解決（ping等）を成功させるために応答を許可する
     try:
         is_loop = ipaddress.ip_address(addr[0]).is_loopback
     except ValueError:
         is_loop = False
 
     my_ips = _get_my_ips()
-    if is_loop or addr[0] in my_ips:
-        return
+    my_hostname = socket.gethostname()
+    is_query_for_me = (queried_hostname.lower() == my_hostname.lower() or 
+                       queried_hostname.lower() == my_hostname.lower() + '.local')
 
-    queried_hostname = _extract_hostname(data)
-    if not queried_hostname:
+    if (is_loop or addr[0] in my_ips) and is_query_for_me:
         return
         
     logger.info(f"[mDNS Server] Received query for: {queried_hostname} from {addr}")
 
     # 自身のホスト名のクエリかチェック
-    my_hostname = socket.gethostname()
-    if queried_hostname.lower() == my_hostname.lower() or queried_hostname.lower() == my_hostname.lower() + '.local':
+    if is_query_for_me:
         # 自身のIPアドレスを取得
         try:
             # 簡易的にUDPソケットを使って外部に接続するふりをして自身のIPを取得する
@@ -147,15 +157,20 @@ def _extract_hostname(data):
     return None
 
 def _build_response(query_data, hostname, ip, ttl):
+    from logger_config import logger
     try:
+        # TTL値が無効な時の安全な補完（デフォルト値を120とする）
+        if ttl is None or not isinstance(ttl, int) or ttl < 0:
+            ttl = 120
+
         # トランザクションIDをコピー
         tx_id = query_data[0:2]
         
         # Flags: 0x8400 (Authoritative Response)
-        flags = b'\x84\x00'
+        flags = (0x8400).to_bytes(2, 'big')
         
         # QDCOUNT=0, ANCOUNT=1, NSCOUNT=0, ARCOUNT=0
-        counts = b'\x00\x00\x00\x01\x00\x00\x00\x00'
+        counts = (0).to_bytes(2, 'big') + (1).to_bytes(2, 'big') + (0).to_bytes(2, 'big') + (0).to_bytes(2, 'big')
         
         header = tx_id + flags + counts
         
@@ -164,16 +179,16 @@ def _build_response(query_data, hostname, ip, ttl):
         qname = b''
         for part in name_parts:
             qname += bytes([len(part)]) + part.encode('utf-8')
-        qname += b'\x00'
+        qname += (0).to_bytes(1, 'big')
         
         # Type A (1), Class IN (1) + Cache Flush (0x8000)
-        type_class = b'\x00\x01\x80\x01'
+        type_class = (1).to_bytes(2, 'big') + (0x8001).to_bytes(2, 'big')
         
         # TTL
         ttl_bytes = ttl.to_bytes(4, 'big')
         
         # RDLENGTH (4 bytes for IPv4)
-        rdlength = b'\x00\x04'
+        rdlength = (4).to_bytes(2, 'big')
         
         # RDATA (IP Address)
         ip_parts = ip.split('.')
@@ -182,4 +197,5 @@ def _build_response(query_data, hostname, ip, ttl):
         response = header + qname + type_class + ttl_bytes + rdlength + rdata
         return response
     except Exception as e:
+        logger.error(f"[mDNS Server] Failed to build response for hostname={hostname}, ip={ip}, ttl={ttl}: {e}", exc_info=True)
         return None

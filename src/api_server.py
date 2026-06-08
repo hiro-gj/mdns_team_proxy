@@ -144,12 +144,15 @@ class mDNSProxyAPIHandler(BaseHTTPRequestHandler):
                         # ループバックアドレスの除外
                         if dns_resolver.is_loopback(record['ip_address']):
                             continue
+                        ttl_val = record.get('ttl')
+                        if ttl_val is None or not isinstance(ttl_val, int) or ttl_val < 0:
+                            ttl_val = 120
                         cursor.execute(
                             '''
                             INSERT INTO other_records (source_proxy_id, hostname, ip_address, record_type, ttl)
                             VALUES (?, ?, ?, ?, ?)
                             ''',
-                            (proxy_id, record['hostname'], record['ip_address'], record.get('record_type', 'A'), record.get('ttl', 120))
+                            (proxy_id, record['hostname'], record['ip_address'], record.get('record_type', 'A'), ttl_val)
                         )
                     
                 # 受信直後にマージ更新を実行
