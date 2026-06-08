@@ -27,9 +27,8 @@ jobs:
 
       - name: Create Release Archive
         run: |
-          # .gitフォルダもアーカイブに含めないように削除
-          rm -rf .git
-          zip -r mdns_proxy.zip .
+          # .gitフォルダは保持したまま、アーカイブ対象から除外
+          zip -r mdns_proxy.zip . -x ".git/*"
 
       - name: Upload Release Asset
         env:
