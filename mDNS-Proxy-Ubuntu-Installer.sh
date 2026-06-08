@@ -7,7 +7,7 @@
 set -e
 
 # 変数定義
-ZIP_URL="https://github.com/hiro-gj/mdns_proxy/archive/refs/tags/latest.zip"
+REPO="hiro-gj/mdns_proxy"
 INSTALL_DIR="/opt/mdns_proxy"
 SERVICE_FILE="/etc/systemd/system/mdns_proxy.service"
 
@@ -15,14 +15,24 @@ echo "=== mDNS Proxy Installer ==="
 
 echo "[1/4] パッケージの更新と必要なツールのインストール..."
 sudo apt -y update
-sudo apt -y install python3 python3-pip unzip curl
+sudo apt -y install python3 python3-pip unzip curl jq
 
 echo "[2/4] ソースコードのダウンロードと展開..."
 TMP_DIR=$(mktemp -d)
 cd "$TMP_DIR"
 
-curl -L -o latest.zip "$ZIP_URL"
-unzip -q latest.zip
+# 最新リリースのZIPのURLをGitHub APIとjqを用いて動的に取得
+ZIP_URL=$(curl -s "https://api.github.com/repos/${REPO}/releases/latest" \
+  | jq -r '.assets[] | select(.name | endswith(".zip")) | .browser_download_url')
+
+# もしリリースのZIP URLが取得できなかった場合のフォールバック
+if [ -z "$ZIP_URL" ] || [ "$ZIP_URL" = "null" ]; then
+  echo "GitHub ReleaseからZIP URLを取得できなかったため、最新タグのZIPにフォールバックします..."
+  ZIP_URL="https://github.com/${REPO}/archive/refs/tags/latest.zip"
+fi
+
+curl -L -o mdns_proxy.zip "$ZIP_URL"
+unzip -q mdns_proxy.zip
 
 # 展開されたディレクトリ名を特定 (例: mdns_proxy-latest)
 EXTRACTED_DIR=$(ls -d */ | head -n 1)
@@ -31,6 +41,14 @@ EXTRACTED_DIR=$(ls -d */ | head -n 1)
 sudo mkdir -p "$INSTALL_DIR"
 # 既存のファイルがある場合は上書き（あるいは削除してコピー）
 sudo cp -rn "${EXTRACTED_DIR}"* "$INSTALL_DIR/" || sudo cp -r "${EXTRACTED_DIR}"* "$INSTALL_DIR/"
+
+# データベースアクセス権限の適切な調整 (一般ユーザー手動実行のサポート)
+# ディレクトリおよび SQLite WAL 作成のために適切な書き込み権限を付与
+sudo mkdir -p "$INSTALL_DIR/db"
+sudo chmod 777 "$INSTALL_DIR/db"
+if [ -f "$INSTALL_DIR/db/mdns_proxy.sqlite3" ]; then
+    sudo chmod 666 "$INSTALL_DIR/db/mdns_proxy.sqlite3"
+fi
 
 # 一時ディレクトリの削除
 cd ~
