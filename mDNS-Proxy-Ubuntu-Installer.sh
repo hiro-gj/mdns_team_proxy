@@ -21,14 +21,22 @@ echo "[2/4] ソースコードのダウンロードと展開..."
 TMP_DIR=$(mktemp -d)
 cd "$TMP_DIR"
 
-# 最新リリースのZIPのURLをGitHub APIとjqを用いて動的に取得
-ZIP_URL=$(curl -s "https://api.github.com/repos/${REPO}/releases/latest" \
-  | jq -r '.assets[] | select(.name | endswith(".zip")) | .browser_download_url')
+# 最新リリース情報を取得
+RELEASE_JSON=$(curl -s "https://api.github.com/repos/${REPO}/releases/latest")
 
-# もしリリースのZIP URLが取得できなかった場合のフォールバック
+# 最新リリースのZIPアセットのURLを動的に取得
+ZIP_URL=$(echo "$RELEASE_JSON" | jq -r '.assets[]? | select(.name | endswith(".zip")) | .browser_download_url')
+
+# もしリリースのZIPアセットのURLが取得できなかった場合、最新タグのZIPにフォールバック
 if [ -z "$ZIP_URL" ] || [ "$ZIP_URL" = "null" ]; then
-  echo "GitHub ReleaseからZIP URLを取得できなかったため、最新タグのZIPにフォールバックします..."
-  ZIP_URL="https://github.com/${REPO}/archive/refs/tags/latest.zip"
+  TAG_NAME=$(echo "$RELEASE_JSON" | jq -r '.tag_name')
+  if [ -n "$TAG_NAME" ] && [ "$TAG_NAME" != "null" ]; then
+    echo "GitHub ReleaseのアセットからZIP URLを取得できなかったため、タグ [${TAG_NAME}] のソースコードZIPにフォールバックします..."
+    ZIP_URL="https://github.com/${REPO}/archive/refs/tags/${TAG_NAME}.zip"
+  else
+    echo "最新リリースのタグ情報を取得できなかったため、mainブランチのZIPにフォールバックします..."
+    ZIP_URL="https://github.com/${REPO}/archive/refs/heads/main.zip"
+  fi
 fi
 
 curl -L -o mdns_proxy.zip "$ZIP_URL"
