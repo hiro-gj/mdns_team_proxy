@@ -25,7 +25,7 @@ interval = 10
 # 発信トークン接頭語
 token_prefix = mDNSProxy_
 # HTTP待ち受けポート
-port = 53080
+port = 80
 # TTL初期値（秒）
 ttl = 120
 # ノード識別ID（複数サーバで重複しない値となる）
