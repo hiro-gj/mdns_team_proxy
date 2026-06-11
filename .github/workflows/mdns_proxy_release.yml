@@ -22,6 +22,7 @@ jobs:
           # フォルダの除外
           rm -rf specs
           rm -rf .github
+          rm -rf .gear
 
           # ファイルの除外
           rm -f .gitattributes
