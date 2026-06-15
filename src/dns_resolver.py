@@ -84,44 +84,89 @@ def _resolve_host(hostname):
             
             sock.sendto(packet, (MDNS_ADDR, MDNS_PORT))
             
-            start_time = time.time()
-            while time.time() - start_time < 2.0:
-                try:
-                    data, addr = sock.recvfrom(1024)
-                    # Parse response (very simplified, looks for the IP in RDATA of an A record response)
-                    # Skip header
-                    if len(data) > 12:
-                        flags = struct.unpack('!H', data[2:4])[0]
-                        if (flags & 0x8000) != 0: # Is response
-                            # For simplicity, we just search for the IP address signature in the packet.
-                            # A real parser would be better, but this is a quick fallback.
-                            # A record RDLENGTH is 4, followed by 4 bytes IP.
-                            # We can look for \x00\x04 followed by 4 bytes.
-                            idx = 12
-                            # Skip question
-                            while data[idx] != 0:
-                                idx += data[idx] + 1
-                            idx += 5 # skip null byte and QTYPE/QCLASS
+            def parse_name(data, offset):
+                parts = []
+                init_offset = offset
+                hopped = False
+                visited = set()
+                while True:
+                    if offset >= len(data):
+                        break
+                    # Prevent infinite loops in corrupted packets
+                    if offset in visited:
+                        break
+                    visited.add(offset)
+                    
+                    length = data[offset]
+                    if (length & 0xC0) == 0xC0:
+                        # Compression pointer
+                        if offset + 1 >= len(data):
+                            break
+                        pointer = struct.unpack('!H', data[offset:offset+2])[0] & 0x3FFF
+                        if not hopped:
+                            init_offset = offset + 2
+                            hopped = True
+                        offset = pointer
+                    elif length == 0:
+                        offset += 1
+                        break
+                    else:
+                        offset += 1
+                        if offset + length > len(data):
+                            break
+                        parts.append(data[offset:offset+length].decode('utf-8', errors='ignore'))
+                        offset += length
+                
+                name = '.'.join(parts)
+                if not hopped:
+                    init_offset = offset
+                return name, init_offset
+
+            try:
+                start_time = time.time()
+                while time.time() - start_time < 2.0:
+                    try:
+                        data, addr = sock.recvfrom(1024)
+                        if len(data) < 12:
+                            continue
+                        
+                        tx_id_resp, flags, qdcount, ancount, nscount, arcount = struct.unpack('!HHHHHH', data[:12])
+                        # Ensure it is a response
+                        if (flags & 0x8000) == 0:
+                            continue
+                        
+                        idx = 12
+                        # Skip or parse questions
+                        for _ in range(qdcount):
+                            if idx >= len(data):
+                                break
+                            qname_parsed, idx = parse_name(data, idx)
+                            idx += 4 # QTYPE (2) + QCLASS (2)
+                        
+                        # Parse answers
+                        for _ in range(ancount):
+                            if idx >= len(data):
+                                break
+                            aname, idx = parse_name(data, idx)
+                            if idx + 10 > len(data):
+                                break
+                            atype, aclass, ttl, rdlength = struct.unpack('!HHIH', data[idx:idx+10])
+                            idx += 10
+                            if idx + rdlength > len(data):
+                                break
+                            rdata = data[idx:idx+rdlength]
+                            idx += rdlength
                             
-                            # Read answer
-                            if len(data) > idx + 10:
-                                # Name pointer or name
-                                if (data[idx] & 0xC0) == 0xC0:
-                                    idx += 2
-                                else:
-                                    while data[idx] != 0:
-                                        idx += data[idx] + 1
-                                    idx += 1
-                                
-                                atype, aclass, ttl, rdlength = struct.unpack('!HHIH', data[idx:idx+10])
-                                idx += 10
-                                if atype == 1 and rdlength == 4: # A record
-                                    ip_bytes = data[idx:idx+4]
-                                    ip_str = '.'.join(str(b) for b in ip_bytes)
+                            # Check if this is an A record matching the queried qname
+                            if atype == 1 and rdlength == 4:
+                                if aname.lower() == qname.lower():
+                                    ip_str = '.'.join(str(b) for b in rdata)
                                     return ip_str
-                except Exception:
-                    pass
-            return None
+                    except Exception:
+                        pass
+                return None
+            finally:
+                sock.close()
 
         ip = _send_mdns_query(target)
         if ip:
