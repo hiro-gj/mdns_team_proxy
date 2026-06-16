@@ -290,7 +290,7 @@ def _merge_records(db):
                     'other' as source_type, 
                     record_id as source_record_id,
                     received_at as registered_at,
-                    2 as priority
+                    3 as priority
                 FROM other_records
                 WHERE ip_address NOT LIKE '127.%' AND ip_address != '::1'
             ),
