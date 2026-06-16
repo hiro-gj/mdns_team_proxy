@@ -1,20 +1,53 @@
-import threading
+try:
+    import _thread as threading_fallback
+    HAS_THREADING = False
+except ImportError:
+    threading_fallback = None
+
+try:
+    import threading
+    HAS_THREADING = True
+except ImportError:
+    # MicroPython fallback
+    pass
+
 import socket
 import select
-import database
+try:
+    import database
+except ImportError:
+    database = None
 
 MDNS_ADDR = '224.0.0.251'
 MDNS_PORT = 5353
 
-def start_listener(db):
-    t = threading.Thread(target=_listen, args=(db,), daemon=True)
-    t.start()
-    return t
+def start_listener(db, sys_config=None):
+    import sys
+    if sys.platform == 'rp2' or not HAS_THREADING:
+        if threading_fallback:
+            threading_fallback.start_new_thread(_listen, (db, sys_config))
+            return True
+        else:
+            # スレッドが使えない場合はメインスレッドでブロッキング実行する
+            _listen(db, sys_config)
+            return True
+    else:
+        t = threading.Thread(target=_listen, args=(db, sys_config), daemon=True)
+        t.start()
+        return t
 
-def _listen(db):
-    # UDPソケットの作成
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+def _setup_socket():
+    import sys
+    # UDPソケットの作成 (MicroPythonではsocket.IPPROTO_UDPが無い、または引数2つでもUDPになるためフォールバック)
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+    except AttributeError:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    except Exception:
+        pass
     
     # OS依存のオプション
     try:
@@ -22,40 +55,103 @@ def _listen(db):
     except AttributeError:
         pass
         
-    sock.bind(('', MDNS_PORT))
+    try:
+        # Pico環境で既にOSが5353を掴んでいる場合は共有設定(SO_REUSEPORT相当)を利用してバインドを試みる
+        if sys.platform == 'rp2':
+            # SO_REUSEPORT (通常15だが環境による) を試す
+            try:
+                SO_REUSEPORT = getattr(socket, 'SO_REUSEPORT', 15)
+                sock.setsockopt(socket.SOL_SOCKET, SO_REUSEPORT, 1)
+            except Exception:
+                pass
+        sock.bind(('', MDNS_PORT))
+    except OSError as e:
+        import time
+        from logger_config import logger
+        logger.warning(f"[mDNS Server] Port 5353 already in use. Retrying in 5 seconds... ({e})")
+        time.sleep(5)
+        try:
+            sock.bind(('', MDNS_PORT))
+        except OSError as e2:
+            logger.error(f"[mDNS Server] Could not bind to port 5353: {e2}. Listening skipped, relying on OS mDNS.")
+            return None
     
     from logger_config import logger
 
-    # マルチキャストグループに参加
+    # マルチキャストグループに参加 (MicroPythonの定数不在エラーも考慮)
     try:
-        mreq = socket.inet_aton(MDNS_ADDR) + socket.inet_aton('0.0.0.0')
-        sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+        # MicroPythonのsocketモジュールに定数がない場合は一般的な数値を直接指定する
+        IPPROTO_IP = getattr(socket, 'IPPROTO_IP', 0)
+        IP_ADD_MEMBERSHIP = getattr(socket, 'IP_ADD_MEMBERSHIP', 1024) # MicroPythonでの標準値、または1024等
+        try:
+            mreq = socket.inet_aton(MDNS_ADDR) + socket.inet_aton('0.0.0.0')
+            sock.setsockopt(IPPROTO_IP, IP_ADD_MEMBERSHIP, mreq)
+        except Exception:
+            # もしinet_atonが無いなどの場合、4バイトのバイナリを直接構築
+            ip_bin = bytes([224, 0, 0, 251]) + bytes([0, 0, 0, 0])
+            sock.setsockopt(IPPROTO_IP, IP_ADD_MEMBERSHIP, ip_bin)
     except Exception as e:
         logger.error(f"[mDNS Server] Failed to join multicast group: {e}")
-        return
+        return None
 
     # マルチキャスト送信設定: IP_MULTICAST_IF（送信IF明示）とTTL=255（②対応）
     try:
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as tmp_s:
+        tmp_s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
             tmp_s.connect(('8.8.8.8', 80))
             primary_ip = tmp_s.getsockname()[0]
-        sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF,
-                        socket.inet_aton(primary_ip))
-        sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 255)
-        logger.info(f"[mDNS Server] Multicast send interface set to: {primary_ip}")
+        except Exception:
+            primary_ip = "0.0.0.0"
+        finally:
+            tmp_s.close()
+        
+        # Pico(MicroPython)環境ではinet_aton or IP_MULTICAST_IFが無い場合があるためtry-exceptで囲む
+        try:
+            IPPROTO_IP = getattr(socket, 'IPPROTO_IP', 0)
+            IP_MULTICAST_IF = getattr(socket, 'IP_MULTICAST_IF', 9)
+            IP_MULTICAST_TTL = getattr(socket, 'IP_MULTICAST_TTL', 10)
+            
+            try:
+                ip_aton = socket.inet_aton(primary_ip)
+            except Exception:
+                ip_aton = bytes([int(p) for p in primary_ip.split('.')])
+                
+            sock.setsockopt(IPPROTO_IP, IP_MULTICAST_IF, ip_aton)
+            sock.setsockopt(IPPROTO_IP, IP_MULTICAST_TTL, 255)
+            logger.info(f"[mDNS Server] Multicast send interface set to: {primary_ip}")
+        except Exception:
+            pass
     except Exception as e:
         logger.warning(f"[mDNS Server] Failed to set multicast send interface: {e}")
 
     logger.info("[mDNS Server] Listening on UDP 5353...")
-    
+    return sock
+
+def _listen(db, sys_config=None):
+    from logger_config import logger
+    sock = _setup_socket()
+    if not sock:
+        return
+
     while True:
         try:
             data, addr = sock.recvfrom(4096)
-            _handle_query(db, sock, data, addr)
+            _handle_query(db, sock, data, addr, sys_config)
         except Exception as e:
             logger.error(f"[mDNS Server] Error: {e}")
 
 def _get_my_ips():
+    import sys
+    # Pico環境の場合
+    if sys.platform == 'rp2':
+        try:
+            import network
+            wlan = network.WLAN(network.STA_IF)
+            if wlan.isconnected():
+                return [wlan.ifconfig()[0]]
+        except Exception:
+            pass
+        return []
     ips = ['127.0.0.1', 'localhost']
     try:
         # ホスト名から解決
@@ -64,21 +160,23 @@ def _get_my_ips():
         pass
     try:
         # ルーティングされるメインIPを取得
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
             s.connect(('8.8.8.8', 80))
             ips.append(s.getsockname()[0])
+        finally:
+            s.close()
     except Exception:
         pass
     return list(set(ips))
 
-def _handle_query(db, sock, data, addr):
+def _handle_query(db, sock, data, addr, sys_config=None):
     from logger_config import logger
-    import ipaddress
     
     # QRビット確認: QR=1（応答パケット）は無視して早期リターン（自己ループ防止）
     if len(data) >= 3 and (data[2] & 0x80):
         return
-
+    
     queried_hostname = _extract_hostname(data)
     if not queried_hostname:
         return
@@ -88,17 +186,19 @@ def _handle_query(db, sock, data, addr):
         return
 
     # 自己解決（自己参照）ループ防止ガード
-    # 自分自身（プロキシノード本体やループバックアドレス全体）からの名前解決クエリに対して、
-    # 自身のホスト名に関するクエリの場合は応答を返さないようにする（無限ループ防止）
-    # ただし、他ノードから同期されたマージ済みレコード(merged_records)の名前解決クエリに対しては、
-    # 自ホスト自身による名前解決（ping等）を成功させるために応答を許可する
-    try:
-        is_loop = ipaddress.ip_address(addr[0]).is_loopback
-    except ValueError:
-        is_loop = False
+    # ipaddressモジュールはMicroPythonに存在しないため、文字列で簡易判定する
+    is_loop = addr[0].startswith('127.') or addr[0] == '::1'
 
     my_ips = _get_my_ips()
-    my_hostname = socket.gethostname()
+    
+    if sys_config and sys_config.has_section('network') and sys_config.has_option('network', 'mdns_hostname'):
+        my_hostname = sys_config.get('network', 'mdns_hostname')
+    else:
+        try:
+            my_hostname = socket.gethostname()
+        except Exception:
+            my_hostname = "mdns-proxy"
+            
     is_query_for_me = (queried_hostname.lower() == my_hostname.lower() or 
                        queried_hostname.lower() == my_hostname.lower() + '.local')
 
@@ -110,25 +210,39 @@ def _handle_query(db, sock, data, addr):
     # 自身のホスト名のクエリかチェック
     if is_query_for_me:
         # 自身のIPアドレスを取得
-        try:
-            # 簡易的にUDPソケットを使って外部に接続するふりをして自身のIPを取得する
-            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-                s.connect(('8.8.8.8', 80))
-                ip = s.getsockname()[0]
+        ip = None
+        if my_ips:
+            ip = my_ips[0]
+        else:
+            try:
+                # 簡易的にUDPソケットを使って外部に接続するふりをして自身のIPを取得する
+                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                try:
+                    s.connect(('8.8.8.8', 80))
+                    ip = s.getsockname()[0]
+                finally:
+                    s.close()
+            except Exception as e:
+                pass
+        
+        if ip:
             ttl = 120
             row = (ip, ttl)
-        except Exception as e:
+        else:
             row = None
     else:
-        with db.connection() as conn:
-            cursor = conn.cursor()
-            base_name = queried_hostname[:-6] if queried_hostname.endswith('.local') else queried_hostname
-            local_name = base_name + '.local'
-            cursor.execute(
-                'SELECT ip_address, ttl FROM merged_records WHERE hostname = ? OR hostname = ? OR hostname = ?',
-                (queried_hostname, base_name, local_name)
-            )
-            row = cursor.fetchone()
+        if db is not None:
+            with db.connection() as conn:
+                cursor = conn.cursor()
+                base_name = queried_hostname[:-6] if queried_hostname.endswith('.local') else queried_hostname
+                local_name = base_name + '.local'
+                cursor.execute(
+                    'SELECT ip_address, ttl FROM merged_records WHERE hostname = ? OR hostname = ? OR hostname = ?',
+                    (queried_hostname, base_name, local_name)
+                )
+                row = cursor.fetchone()
+        else:
+            row = None
         
     if row:
         ip, ttl = row
@@ -144,9 +258,17 @@ def _handle_query(db, sock, data, addr):
                 # mDNSマルチキャストグループへも送信（ポート5353）
                 # ここで IP_MULTICAST_IF の設定等が必要かもしれないが、簡易的に別ソケットから送信
                 try:
-                    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as mc_sock:
-                        mc_sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 255)
+                    mc_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                    try:
+                        try:
+                            IPPROTO_IP = getattr(socket, 'IPPROTO_IP', 0)
+                            IP_MULTICAST_TTL = getattr(socket, 'IP_MULTICAST_TTL', 10)
+                            mc_sock.setsockopt(IPPROTO_IP, IP_MULTICAST_TTL, 255)
+                        except Exception:
+                            pass
                         mc_sock.sendto(response, ('224.0.0.251', 5353))
+                    finally:
+                        mc_sock.close()
                 except Exception as me:
                     logger.warning(f"[mDNS Server] Failed to send multicast: {me}")
             except Exception as e:

@@ -48,6 +48,9 @@ def loop_task(db, sys_config):
             # 3. プロキシ発見（固定IPから）
             _discover_proxies(db, sys_config)
 
+            # 3.5. 他のプロキシからレコードをプル（自発的プル同期）
+            _pull_from_others(db, sys_config)
+
             # 4. レコードを他のプロキシに送信（中継・収束方式：self_records + 有効な other_records を同期）
             _sync_to_others(db, sys_config)
 
@@ -309,6 +312,85 @@ def _merge_records(db):
         ''')
         
         conn.commit()
+
+def _pull_from_others(db, sys_config):
+    # network セクションから external_proxies を取得し、それらの /api/merged-records からレコードをプルする
+    if not sys_config.has_option('network', 'external_proxies'):
+        return
+    proxies = sys_config.get('network', 'external_proxies').split(',')
+    
+    my_node_id = _get_node_id(sys_config)
+    import mdns_server
+    my_ips = mdns_server._get_my_ips()
+
+    # MicroPython の場合は urequests を使い、それ以外（通常の Python）は urllib.request を使う
+    is_pico = False
+    try:
+        import urequests
+        is_pico = True
+    except ImportError:
+        import urllib.request
+        import json
+
+    for proxy in proxies:
+        proxy = proxy.strip()
+        if not proxy: continue
+        
+        if ':' in proxy:
+            ip, port_str = proxy.split(':', 1)
+            try:
+                port = int(port_str)
+            except ValueError:
+                port = 53080
+        else:
+            ip = proxy
+            port = 53080
+            
+        if ip in my_ips:
+            continue
+
+        url = f"http://{ip}:{port}/api/merged-records"
+        try:
+            records = []
+            if is_pico:
+                res = urequests.get(url, timeout=5)
+                if res.status_code == 200:
+                    records = res.json()
+                res.close()
+            else:
+                req = urllib.request.Request(url, method='GET')
+                with urllib.request.urlopen(req, timeout=5) as response:
+                    if response.status == 200:
+                        records = json.loads(response.read().decode('utf-8'))
+            
+            if not records:
+                continue
+
+            with db.connection() as conn:
+                cursor = conn.cursor()
+                # 相手プロキシの ID を取得または挿入
+                cursor.execute('SELECT proxy_id FROM other_proxies WHERE ip_address = ?', (ip,))
+                row = cursor.fetchone()
+                if row:
+                    proxy_id = row[0]
+                else:
+                    cursor.execute(
+                        'INSERT INTO other_proxies (ip_address, port, token, discovery_method) VALUES (?, ?, ?, ?)',
+                        (ip, port, 'dummy_token', 'fixed')
+                    )
+                    proxy_id = cursor.lastrowid
+                
+                # 取得したレコードを other_records に格納 (既存のそのプロキシからのレコードを更新)
+                cursor.execute('DELETE FROM other_records WHERE source_proxy_id = ?', (proxy_id,))
+                for r in records:
+                    cursor.execute(
+                        'INSERT INTO other_records (source_proxy_id, hostname, ip_address, record_type, ttl) VALUES (?, ?, ?, ?, ?)',
+                        (proxy_id, r['hostname'], r['ip_address'], r['record_type'], r['ttl'])
+                    )
+                conn.commit()
+                logger.info(f"[_pull_from_others] Pulled {len(records)} records from {ip}:{port}")
+        except Exception as e:
+            logger.error(f"[_pull_from_others] Failed to pull records from {ip}:{port}: {e}")
 
 def _cleanup_records(db, interval):
     with db.connection() as conn:
