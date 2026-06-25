@@ -42,13 +42,19 @@ fi
 curl -L -o mdns_proxy.zip "$ZIP_URL"
 unzip -q mdns_proxy.zip
 
-# 展開されたディレクトリ名を特定 (例: mdns_proxy-latest)
-EXTRACTED_DIR=$(ls -d */ | head -n 1)
+# 展開されたディレクトリ構造を判定
+if [ -d "src" ]; then
+  # 展開した直下にsrcディレクトリがある場合 (ルート展開型ZIP)
+  EXTRACTED_DIR=""
+else
+  # 展開した中に親ディレクトリが1つある場合 (ネスト型ZIP)
+  EXTRACTED_DIR=$(ls -d */ | head -n 1)
+fi
 
 # インストール先の作成とファイルの配置
 sudo mkdir -p "$INSTALL_DIR"
 # 既存のファイルがある場合は上書き（あるいは削除してコピー）
-sudo cp -rn "${EXTRACTED_DIR}"* "$INSTALL_DIR/" || sudo cp -r "${EXTRACTED_DIR}"* "$INSTALL_DIR/"
+sudo cp -rn ${EXTRACTED_DIR}* "$INSTALL_DIR/" || sudo cp -r ${EXTRACTED_DIR}* "$INSTALL_DIR/"
 
 # データベースアクセス権限の適切な調整 (一般ユーザー手動実行のサポート)
 # ディレクトリおよび SQLite WAL 作成のために適切な書き込み権限を付与
