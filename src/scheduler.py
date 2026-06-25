@@ -259,58 +259,181 @@ def _sync_to_others(db, sys_config):
             except Exception as e:
                 logger.error(f"[_sync_to_others] Failed to sync static_hosts with {actual_ip}:{actual_port}: {e}")
 
+def _get_my_ips_with_masks():
+    import sys
+    import socket
+    res = []
+    
+    # Pico (MicroPython) の場合
+    if sys.platform == 'rp2':
+        try:
+            import network
+            wlan = network.WLAN(network.STA_IF)
+            if wlan.isconnected():
+                ifconfig = wlan.ifconfig()
+                res.append((ifconfig[0], ifconfig[1]))
+        except Exception:
+            pass
+        return res
+        
+    # 通常の Python (Linux / Windows) の場合
+    ips = []
+    try:
+        ips.append(socket.gethostbyname(socket.gethostname()))
+    except Exception:
+        pass
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.connect(('8.8.8.8', 80))
+            ips.append(s.getsockname()[0])
+        finally:
+            s.close()
+    except Exception:
+        pass
+        
+    ips = list(set(ips))
+    
+    if sys.platform != 'win32':
+        try:
+            import subprocess
+            out = subprocess.check_output(['ip', '-o', 'addr', 'show'], stderr=subprocess.DEVNULL).decode('utf-8')
+            for line in out.splitlines():
+                parts = line.split()
+                if 'inet' in parts:
+                    idx = parts.index('inet')
+                    ip_cidr = parts[idx+1]
+                    if '/' in ip_cidr:
+                        ip, cidr = ip_cidr.split('/')
+                        if not ip.startswith('127.'):
+                            cidr_num = int(cidr)
+                            mask_int = (0xffffffff << (32 - cidr_num)) & 0xffffffff
+                            mask = f"{(mask_int >> 24) & 0xff}.{(mask_int >> 16) & 0xff}.{(mask_int >> 8) & 0xff}.{mask_int & 0xff}"
+                            res.append((ip, mask))
+        except Exception:
+            pass
+            
+    if not res:
+        for ip in ips:
+            if not ip.startswith('127.'):
+                res.append((ip, "255.255.255.0"))
+                
+    return res
+
+def is_in_my_subnet(target_ip, my_ips_with_masks):
+    if target_ip.startswith('127.') or target_ip == '::1':
+        return True
+    try:
+        target_parts = [int(p) for p in target_ip.split('.')]
+        target_int = (target_parts[0] << 24) + (target_parts[1] << 16) + (target_parts[2] << 8) + target_parts[3]
+    except Exception:
+        return False
+        
+    for my_ip, mask in my_ips_with_masks:
+        try:
+            my_parts = [int(p) for p in my_ip.split('.')]
+            mask_parts = [int(p) for p in mask.split('.')]
+            
+            my_int = (my_parts[0] << 24) + (my_parts[1] << 16) + (my_parts[2] << 8) + my_parts[3]
+            mask_int = (mask_parts[0] << 24) + (mask_parts[1] << 16) + (mask_parts[2] << 8) + mask_parts[3]
+            
+            if (target_int & mask_int) == (my_int & mask_int):
+                return True
+        except Exception:
+            continue
+    return False
+
 def _merge_records(db):
+    my_ips_with_masks = _get_my_ips_with_masks()
+
     with db.connection() as conn:
         cursor = conn.cursor()
-        # 一旦全クリア
+        
+        # 1. すべての self_records と other_records を読み出す
+        cursor.execute('SELECT hostname, ip_address, record_type, ttl, resolution_method, updated_at, record_id FROM self_records')
+        self_rows = cursor.fetchall()
+        
+        cursor.execute('SELECT hostname, ip_address, record_type, ttl, received_at, record_id FROM other_records')
+        other_rows = cursor.fetchall()
+
+        candidates = []
+        
+        # self_records からの候補
+        for row in self_rows:
+            hostname, ip, record_type, ttl, resolution_method, updated_at, record_id = row
+            if ip.startswith('127.') or ip == '::1':
+                continue
+                
+            is_self = is_in_my_subnet(ip, my_ips_with_masks)
+            source_type = 'self' if is_self else 'other'
+            
+            if resolution_method == 'static':
+                priority = 1
+            elif is_self:
+                priority = 2
+            else:
+                priority = 3
+                
+            candidates.append({
+                'hostname': hostname,
+                'ip_address': ip,
+                'record_type': record_type,
+                'ttl': ttl,
+                'source_type': source_type,
+                'source_record_id': record_id,
+                'registered_at': updated_at,
+                'priority': priority
+            })
+
+        # other_records からの候補
+        for row in other_rows:
+            hostname, ip, record_type, ttl, received_at, record_id = row
+            if ip.startswith('127.') or ip == '::1':
+                continue
+                
+            is_self = is_in_my_subnet(ip, my_ips_with_masks)
+            source_type = 'self' if is_self else 'other'
+            
+            priority = 2 if is_self else 3
+            
+            candidates.append({
+                'hostname': hostname,
+                'ip_address': ip,
+                'record_type': record_type,
+                'ttl': ttl,
+                'source_type': source_type,
+                'source_record_id': record_id,
+                'registered_at': received_at,
+                'priority': priority
+            })
+
+        by_host = {}
+        for c in candidates:
+            host = c['hostname']
+            if host not in by_host:
+                by_host[host] = []
+            by_host[host].append(c)
+
+        merged = []
+        for host, items in by_host.items():
+            # 優先順位：
+            # 1. priority ASC (1=static_self, 2=dynamic_self, 3=other)
+            # 2. registered_at DESC (最新の登録日時を優先)
+            # 3. source_record_id DESC (同一日時ならIDが大きい方を優先)
+            items.sort(key=lambda x: (x['priority'], x['registered_at'] or '', -x['source_record_id']))
+            best = items[0]
+            merged.append(best)
+
+        # 2. merged_records テーブルをクリアして、新しいマージ結果を書き込む
         cursor.execute('DELETE FROM merged_records')
-        
-        # self_records（自ノード解決）と other_records（他ノード同期）から、
-        # ホスト名（hostname）ごとに最良の1件のIPアドレスのみを決定してマージする（最新・最良優先マージアルゴリズム）。
-        # 優先順位：1. 手動固定IP（resolution_method = 'static'）を最優先。
-        #           2. それ以外（自動名前解決）は、登録・更新日時（registered_at）がより新しいものを優先。
-        cursor.execute('''
-            WITH candidates AS (
-                SELECT 
-                    hostname, 
-                    ip_address, 
-                    record_type, 
-                    ttl, 
-                    'self' as source_type, 
-                    record_id as source_record_id,
-                    updated_at as registered_at,
-                    CASE WHEN resolution_method = 'static' THEN 1 ELSE 2 END as priority
-                FROM self_records
-                WHERE ip_address NOT LIKE '127.%' AND ip_address != '::1'
-
-                UNION ALL
-
-                SELECT 
-                    hostname, 
-                    ip_address, 
-                    record_type, 
-                    ttl, 
-                    'other' as source_type, 
-                    record_id as source_record_id,
-                    received_at as registered_at,
-                    3 as priority
-                FROM other_records
-                WHERE ip_address NOT LIKE '127.%' AND ip_address != '::1'
-            ),
-            ranked AS (
-                SELECT *,
-                       ROW_NUMBER() OVER (
-                           PARTITION BY hostname 
-                           ORDER BY priority ASC, registered_at DESC, source_record_id DESC
-                       ) as rn
-                FROM candidates
+        for m in merged:
+            cursor.execute(
+                '''
+                INSERT INTO merged_records (hostname, ip_address, record_type, ttl, source_type, source_record_id)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ''',
+                (m['hostname'], m['ip_address'], m['record_type'], m['ttl'], m['source_type'], m['source_record_id'])
             )
-            INSERT INTO merged_records (hostname, ip_address, record_type, ttl, source_type, source_record_id)
-            SELECT hostname, ip_address, record_type, ttl, source_type, source_record_id
-            FROM ranked
-            WHERE rn = 1
-        ''')
-        
         conn.commit()
 
 def _pull_from_others(db, sys_config):
