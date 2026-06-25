@@ -419,38 +419,138 @@ class Cursor:
                 kept.append(r)
         return kept, deleted
 
+    def _get_my_ips_with_masks(self):
+        import sys
+        import socket
+        res = []
+        
+        if sys.platform == 'rp2':
+            try:
+                import network
+                wlan = network.WLAN(network.STA_IF)
+                if wlan.isconnected():
+                    ifconfig = wlan.ifconfig()
+                    res.append((ifconfig[0], ifconfig[1]))
+            except Exception:
+                pass
+            return res
+            
+        ips = []
+        try:
+            ips.append(socket.gethostbyname(socket.gethostname()))
+        except Exception:
+            pass
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            try:
+                s.connect(('8.8.8.8', 80))
+                ips.append(s.getsockname()[0])
+            finally:
+                s.close()
+        except Exception:
+            pass
+            
+        ips = list(set(ips))
+        
+        if sys.platform != 'win32':
+            try:
+                import subprocess
+                out = subprocess.check_output(['ip', '-o', 'addr', 'show'], stderr=subprocess.DEVNULL).decode('utf-8')
+                for line in out.splitlines():
+                    parts = line.split()
+                    if 'inet' in parts:
+                        idx = parts.index('inet')
+                        ip_cidr = parts[idx+1]
+                        if '/' in ip_cidr:
+                            ip, cidr = ip_cidr.split('/')
+                            if not ip.startswith('127.'):
+                                cidr_num = int(cidr)
+                                mask_int = (0xffffffff << (32 - cidr_num)) & 0xffffffff
+                                mask = f"{(mask_int >> 24) & 0xff}.{(mask_int >> 16) & 0xff}.{(mask_int >> 8) & 0xff}.{mask_int & 0xff}"
+                                res.append((ip, mask))
+            except Exception:
+                pass
+                
+        if not res:
+            for ip in ips:
+                if not ip.startswith('127.'):
+                    res.append((ip, "255.255.255.0"))
+                    
+        return res
+
+    def _is_in_my_subnet(self, target_ip, my_ips_with_masks):
+        if target_ip.startswith('127.') or target_ip == '::1':
+            return True
+        try:
+            target_parts = [int(p) for p in target_ip.split('.')]
+            target_int = (target_parts[0] << 24) + (target_parts[1] << 16) + (target_parts[2] << 8) + target_parts[3]
+        except Exception:
+            return False
+            
+        for my_ip, mask in my_ips_with_masks:
+            try:
+                my_parts = [int(p) for p in my_ip.split('.')]
+                mask_parts = [int(p) for p in mask.split('.')]
+                
+                my_int = (my_parts[0] << 24) + (my_parts[1] << 16) + (my_parts[2] << 8) + my_parts[3]
+                mask_int = (mask_parts[0] << 24) + (mask_parts[1] << 16) + (mask_parts[2] << 8) + mask_parts[3]
+                
+                if (target_int & mask_int) == (my_int & mask_int):
+                    return True
+            except Exception:
+                continue
+        return False
+
     def _run_merge_records_python(self):
         self.connection.tables['merged_records'] = []
         candidates = []
+        my_ips_with_masks = self._get_my_ips_with_masks()
         
         for r in self.connection.tables.get('self_records', []):
             ip = r.get('ip_address', '')
             if ip.startswith('127.') or ip == '::1':
                 continue
+                
+            is_self = self._is_in_my_subnet(ip, my_ips_with_masks)
+            source_type = 'self' if is_self else 'other'
+            
+            if r.get('resolution_method') == 'static':
+                priority = 1
+            elif is_self:
+                priority = 2
+            else:
+                priority = 3
+                
             candidates.append({
                 'hostname': r.get('hostname'),
                 'ip_address': ip,
                 'record_type': r.get('record_type'),
                 'ttl': r.get('ttl'),
-                'source_type': 'self',
+                'source_type': source_type,
                 'source_record_id': r.get('record_id'),
                 'registered_at': r.get('updated_at', '2026-06-16 12:00:00'),
-                'priority': 1 if r.get('resolution_method') == 'static' else 2
+                'priority': priority
             })
             
         for r in self.connection.tables.get('other_records', []):
             ip = r.get('ip_address', '')
             if ip.startswith('127.') or ip == '::1':
                 continue
+                
+            is_self = self._is_in_my_subnet(ip, my_ips_with_masks)
+            source_type = 'self' if is_self else 'other'
+            
+            priority = 2 if is_self else 3
+            
             candidates.append({
                 'hostname': r.get('hostname'),
                 'ip_address': ip,
                 'record_type': r.get('record_type'),
                 'ttl': r.get('ttl'),
-                'source_type': 'other',
+                'source_type': source_type,
                 'source_record_id': r.get('record_id'),
                 'registered_at': r.get('received_at', '2026-06-16 12:00:00'),
-                'priority': 2
+                'priority': priority
             })
             
         by_host = {}
@@ -462,7 +562,7 @@ class Cursor:
             
         merged = []
         for host, items in by_host.items():
-            items.sort(key=lambda x: (x['priority'], -1 * (len(items) - items.index(x))))
+            items.sort(key=lambda x: (x['priority'], x['registered_at'] or '', -x['source_record_id']))
             best = items[0]
             
             merged.append({
