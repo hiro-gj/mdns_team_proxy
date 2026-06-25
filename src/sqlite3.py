@@ -254,7 +254,7 @@ class Cursor:
                     self.connection.tables[table_name] = []
 
                 param_idx = 0
-                is_ttl_decrement = "ttl = ttl - ?" in set_clause.replace(' ', '')
+                is_ttl_decrement = "ttl=ttl-?" in set_clause.replace(' ', '')
                 decrement_val = 0
                 if is_ttl_decrement:
                     decrement_val = params[0] if params else 0
@@ -284,7 +284,10 @@ class Cursor:
                     if match:
                         if is_ttl_decrement:
                             if 'ttl' in row and row['ttl'] is not None:
-                                row['ttl'] = int(row['ttl']) - int(decrement_val)
+                                try:
+                                    row['ttl'] = int(row['ttl']) - int(decrement_val)
+                                except ValueError:
+                                    pass  # 'pure_mdns' や 'static' など数値でないTTLは減算しない
                         else:
                             for col, val in updates.items():
                                 row[col] = val
@@ -398,14 +401,26 @@ class Cursor:
             return str(row_val) == str(val), consumed
         elif op == '!=':
             return str(row_val) != str(val), consumed
-        elif op == '<=':
-            return float(row_val) <= float(val), consumed
+
+        def safe_float(v):
+            try:
+                return float(v)
+            except (ValueError, TypeError):
+                return None
+
+        r_float = safe_float(row_val)
+        v_float = safe_float(val)
+        if r_float is None or v_float is None:
+            return False, consumed
+
+        if op == '<=':
+            return r_float <= v_float, consumed
         elif op == '>=':
-            return float(row_val) >= float(val), consumed
+            return r_float >= v_float, consumed
         elif op == '<':
-            return float(row_val) < float(val), consumed
+            return r_float < v_float, consumed
         elif op == '>':
-            return float(row_val) > float(val), consumed
+            return r_float > v_float, consumed
             
         return False, consumed
 
